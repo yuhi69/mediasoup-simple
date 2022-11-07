@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="charset=UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRTC-SFU | mediasoup3</title>
+  <script src="/js/mediasoup-client.js"></script>
+  <script src="socket.io/socket.io.js"></script>
+  <link rel="stylesheet" href="/css/style.css">
+  <style>
+    .local-video,
+    .remote-video {
+      display: block;
+      background-color: #000;
+      margin: 0;
+      height: 240px;
+      width: 320px;
+    }
+    .local-video {
+      transform: scaleX(-1);
+    }
+  </style>
+</head>
+<body onload="loadPage();">
+  <div class="container-fluid" style="height: 100vh;">
+    <div class="row">
+      <div class="col">
+        <video id="selfVideo" autoplay muted class="local-video"></video>
+      </div>
+      <div id="remoteVideoCol1" class="col">
+        <video id="remoteVideo1" autoplay class="remote-video"></video>
+      </div>
+      <div class="col">
+        <video id="remoteVideo2" autoplay class="remote-video"></video>
+      </div>
+      <div id="remoteVideoCol1" class="col">
+      </div>
+      <div id="remoteVideoCol2" class="col">
+      </div>
+    </div>
+  </div>
+
+  <script src="/js/bootstrap.bundle.min.js"></script>
+</body>
+<script>
+  let _localStream = undefined;
+  let _socket = undefined;
+  let _clientId = undefined;
+  let _device = undefined;
+  let _producerTransport = undefined;
+  let _videoProducer = undefined;
+  let _audioProducer = undefined;
+  let _consumerTransport = undefined;
+
+  /*
+   * リモートビデオ管理. (静的Ver.)
+   */
+  let _remotes = [
+    { elementId: 'remoteVideo1', remoteId: undefined },
+    { elementId: 'remoteVideo2', remoteId: undefined }
+  ];
+
+  function selectElementId(remoteId) {
+    for (let obj of _remotes) {
+      if (obj.remoteId == remoteId) {
+        return obj.elementId;
+      }
+    }
+  }
+
+  function removeRemoteVideo(remoteId) {
+    for (let obj of _remotes) {
+      if (obj.remoteId == remoteId) {
+        obj.remoteId = undefined;
+        return;
+      }
+    }
+  }
+
+  function getRemoteVideoElement(remoteId) {
+    // 登録済みの場合.
+    for (let obj of _remotes) {
+      if (obj.remoteId == remoteId) {
+        return document.getElementById(obj.elementId);
+      }
+    }
+
+    // 未登録なら空いているものに紐づけ.
+    for (let obj of _remotes) {
+      if (!obj.remoteId) {
+        obj.remoteId = remoteId;
+        return document.getElementById(obj.elementId);
+      }
+    }
+  }
+  /* end of リモートビデオ管理. */
+
+  function sendRequest(type, data) {
+    return new Promise((resolve, reject) => {
+      _socket.emit(type, data, (err, response) => {
+        if (!err) {
+          // Success response, so pass the mediasoup response to the local Room.
+          resolve(response);
+        } else {
+          reject(err);
+        }
+      });
+    });
+  }
+
+  async function loadPage() {
+    for (let obj of _remotes) {
+      document.getElementById(obj.elementId).srcObject = null;
+    }
+    await startMedia();
+    if (!_localStream) {
+      return;
+    }
+    await connectSocket().catch((err) => {
+      console.error(err);
+      return;
+    });
+    await loadDevice();
+    if (!_device) {
+      return;
+    }
+    await createProducer();
+  }
+
+  function isSocketConnected() {
+    if (_socket) {
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  /**
+   * socket.io connect.
+   * return Promise
+   */
+  function connectSocket() {
+    disconnectSocket();
+
+    return new Promise((resolve, reject) => {
+      _socket = io.connect('/');
+
+      _socket.on('connect', (event) => {
+        console.log('socket', 'connect', _socket.id);
+        _clientId = _socket.id;
+        resolve();
+      });
+      _socket.on('error', (error) => {
+        console.error('socket', 'error', error);
+        reject(error);
+      });
+      _socket.on('disconnect', (event) => {
+        console.log('socket', 'disconnect');
+      });
+
+      _socket.on('newProducer', (message) => {
+        console.log('socket', 'newProducer', message);
+        const remoteId = message.remoteId;
+        const prdId = message.producerId;
+        const kind = message.kind;
+        if (kind === 'video') {
+          consumeAdd(_consumerTransport, remoteId, prdId, kind);
+        } else if (kind === 'audio') {
+          consumeAdd(_consumerTransport, remoteId, prdId, kind);
+        }
+      });
+      _socket.on('producerClosed', (message) => {
+        console.log('socket', 'producerClosed', message);
+        const localId = message.localId;
+        const remoteId = message.remoteId;
+        const kind = message.kind;
+        removeConsumer(remoteId, kind);
+
+        let elementId = selectElementId(remoteId);
+        stopVideo(document.getElementById(elementId));
+        removeRemoteVideo(remoteId);
+      });
+    });
+  }
+
+  function disconnectSocket() {
+    if (_socket) {
+      _socket.close();
+      _socket = undefined;
+      _clientId = undefined;
+    }
+  }
+
+  async function playVideo(videoElem) {
+    try {
+      videoElem.volume = 0;
+      await videoElem.play();
+    } catch(err) {
+      console.error('play video error.');
+    }
+  }
+
+  function stopVideo(videoElem) {
+    if (videoElem) {
+      videoElem.pause();
+      videoElem.srcObject = null;
+    }
+  }
+
+  function startMedia() {
+    if (_localStream) {
+      return;
+    }
+
+    return navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: {
+				width: { ideal: 320, max: 1280 },
+        height: { ideal: 240, max: 720 },
+        frameRate: 5
+			}
+    }).then((stream) => {
+      if (!stream) {
+        throw('local stream is none.');
+      }
+      let track = stream.getVideoTracks()[0];
+      console.log(`frameRate:${track.getSettings().frameRate}`);
+      _localStream = stream;
+
+      const selfVideo = document.getElementById('selfVideo');
+      if (selfVideo.srcObject) {
+        console.warn('element ALREADY playing, so ignore');
+      } else {
+        selfVideo.srcObject = _localStream;
+        playVideo(selfVideo);
+      }
+    }).catch(err => {
+      console.error('media ERROR:', err);
+    });
+  }
+
+  async function createProducer() {
+    // --- get transport info ---
+    const transportOptions = await sendRequest('createProducerTransport', {});
+    _producerTransport = _device.createSendTransport(transportOptions);
+
+    // --- join & start publish --
+    _producerTransport.on('connect', producerTransport_onConnect);
+    _producerTransport.on('produce', producerTransport_onProduce);
+    _producerTransport.on('connectionstatechange', producerTransport_onConnectionstatechange);
+
+    const videoTrack = _localStream.getVideoTracks()[0];
+    if (videoTrack) {
+      console.log("send frameRate:" + videoTrack.getSettings().frameRate);
+      console.log("send width:" + videoTrack.getSettings().width);
+      console.log("send height:" + videoTrack.getSettings().height);
+      const producerOptions = { track: videoTrack };
+      _videoProducer = await _producerTransport.produce(producerOptions);
+    }
+    const audioTrack = _localStream.getAudioTracks()[0];
+    if (audioTrack) {
+      const producerOptions = { track: audioTrack };
+      audioProducer = await _producerTransport.produce(producerOptions);
+    }
+  }
+
+  /* producerTransport callbacks. */
+
+  async function producerTransport_onConnect({ dtlsParameters }, callback, errback) {
+    console.log('ProducerTransport', 'connect');
+    sendRequest('connectProducerTransport', { dtlsParameters: dtlsParameters })
+      .then(callback)
+      .catch(errback);
+  }
+
+  async function producerTransport_onProduce({ kind, rtpParameters }, callback, errback) {
+    console.log('ProducerTransport', 'produce', kind);
+    try {
+      const { id } = await sendRequest('produce', {
+        transportId: _producerTransport.id,
+        kind,
+        rtpParameters,
+        type: 'center',
+      });
+      callback({ id });
+
+      subscribe();
+    } catch (err) {
+      errback(err);
+    }
+  }
+
+  function producerTransport_onConnectionstatechange(state) {
+    console.log('ProducerTransport', 'connectionstatechange', state);
+  }
+
+  async function subscribe() {
+    if (!isSocketConnected()) {
+      await connectSocket().catch(err => {
+        console.error(err);
+        return;
+      });
+
+      await loadDevice();
+      if (!_device) {
+        return;
+      }
+    }
+
+    if (_consumerTransport) {
+      return;
+    }
+    // --- prepare transport ---
+
+    // --- createConsumerTransport --
+    const transportOptions = await sendRequest('createConsumerTransport', {});
+    _consumerTransport = _device.createRecvTransport(transportOptions);
+
+    // --- join & start publish --
+    _consumerTransport.on('connect', consumerTransport_onConnect);
+    _consumerTransport.on('connectionstatechange', consumerTransport_onConnectionstatechange);
+
+    const remoteInfo = await sendRequest('getCurrentProducers', { localId: _clientId })
+    .catch(err => {
+      console.error('getCurrentProducers ERROR:', err);
+      return;
+    });
+
+    // consume all.
+    remoteInfo.remoteVideoIds.forEach(rId => {
+      consumeAdd(_consumerTransport, rId, null, 'video');
+    });
+    remoteInfo.remoteAudioIds.forEach(rId => {
+      consumeAdd(_consumerTransport, rId, null, 'audio');
+    });
+  }
+
+  /* consumerTransport callbacks. */
+
+  async function consumerTransport_onConnect({ dtlsParameters }, callback, errback) {
+    console.log('ConsumerTransport', 'connect');
+    sendRequest('connectConsumerTransport', { dtlsParameters: dtlsParameters })
+      .then(callback)
+      .catch(errback);
+  }
+
+  function consumerTransport_onConnectionstatechange(state) {
+    console.log('ConsumerTransport', 'connectionstatechange', state);
+    if (state === 'failed') {
+      _producerTransport.close();
+    }
+  }
+
+  function disconnect() {
+    if (_localStream) {
+      stopVideo(document.getElementById('selfVideo'));
+      let tracks = _localStream.getTracks();
+      if (tracks) {
+        tracks.forEach(track => track.stop());
+      }
+      _localStream = undefined;
+    }
+    if (_videoProducer) {
+      _videoProducer.close(); // localStream will stop
+      _videoProducer = undefined;
+    }
+    if (_audioProducer) {
+      _audioProducer.close(); // localStream will stop
+      _audioProducer = undefined;
+    }
+    if (_producerTransport) {
+      _producerTransport.close(); // localStream will stop
+      _producerTransport = undefined;
+    }
+
+    removeAllConsumers();
+
+    if (_consumerTransport) {
+      _consumerTransport.close();
+      _consumerTransport = undefined;
+    }
+
+    for (let obj of _remotes) {
+      stopVideo(document.getElementById(obj.elementId));
+    }
+
+    disconnectSocket();
+  }
+
+  async function loadDevice() {
+    const routerRtpCapabilities = await sendRequest('getRouterRtpCapabilities', {});
+    try {
+      _device = new MediasoupClient.Device();
+    } catch (err) {
+      if (err.name === 'UnsupportedError') {
+        alert('browser not supported');
+        return;
+      }
+    }
+    await _device.load({ routerRtpCapabilities });
+  }
+
+  async function consumeAdd(transport, remoteId, prdId, trackKind) {
+    const { rtpCapabilities } = _device;
+
+    const data = await sendRequest('newConsumer', { rtpCapabilities: rtpCapabilities, remoteId, kind: trackKind })
+      .catch(err => {
+        console.error('newConsumer ERROR', err);
+      });
+    const {
+      producerId,
+      id,
+      kind,
+      rtpParameters,
+    } = data;
+    if (prdId && (prdId !== producerId)) {
+      console.warn('producerID NOT MATCH');
+    }
+
+    let codecOptions = {};
+    const consumer = await transport.consume({
+      id,
+      producerId,
+      kind,
+      rtpParameters,
+      codecOptions,
+    });
+
+    // 用意したVideoElement以降は表示しない仕様.
+    let remoteVideo = getRemoteVideoElement(remoteId);
+    if (remoteVideo) {
+      if (remoteVideo.srcObject) {
+        remoteVideo.srcObject.addTrack(consumer.track);
+      } else {
+        const newStream = new MediaStream();
+        newStream.addTrack(consumer.track);
+        remoteVideo.srcObject = newStream;
+        playVideo(remoteVideo).then(() => {
+          remoteVideo.volume = 1.0;
+        });
+      }
+    }
+
+    addConsumer(remoteId, consumer, kind);
+
+    consumer.remoteId = remoteId;
+    consumer.on("transportclose", () => {
+      console.log('consumer', 'transportclose', consumer.remoteId);
+    });
+    consumer.on("producerclose", () => {
+      console.log('consumer', 'producerclose', consumer.remoteId);
+      consumer.close();
+      removeConsumer(consumer.remoteId, kind);
+
+      let elementId = selectElementId(consumer.remoteId);
+      stopVideo(document.getElementById(elementId));
+      removeRemoteVideo(consumer.remoteId);
+    });
+    consumer.on('trackended', () => {
+      console.log('consumer', 'trackended', consumer.remoteId);
+    });
+
+    if (kind === 'video') {
+      sendRequest('resumeConsumer', { remoteId, kind })
+      .then(() => {
+      }).catch(err => {
+        console.error('resumeConsumer ERROR:', err);
+      });
+    }
+  }
+
+  let _videoConsumers = {};
+  let _audioConsumers = {};
+
+  function removeAllConsumers() {
+    for (const key in _videoConsumers) {
+      const consumer = _videoConsumers[key];
+      consumer.close();
+      delete _videoConsumers[key];
+    }
+    for (const key in _audioConsumers) {
+      const consumer = _audioConsumers[key];
+      consumer.close();
+      delete _audioConsumers[key];
+    }
+  }
+
+  function addConsumer(id, consumer, kind) {
+    if (kind === 'video') {
+      _videoConsumers[id] = consumer;
+      console.log('addConsumer videoConsumers count=' + Object.keys(_videoConsumers).length);
+    } else if (kind === 'audio') {
+      _audioConsumers[id] = consumer;
+      console.log('addConsumer audioConsumers count=' + Object.keys(_audioConsumers).length);
+    } else {
+      console.warn(`UNKNOWN consumer kind=${kind}`);
+    }
+  }
+
+  function removeConsumer(id, kind) {
+    if (kind === 'video') {
+      delete _videoConsumers[id];
+    } else if (kind === 'audio') {
+      delete _audioConsumers[id];
+    } else {
+      console.warn(`UNKNOWN consumer kind=${kind}`);
+    }
+  }
+</script>
+</html>
